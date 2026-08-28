@@ -104,36 +104,8 @@ def clean_text(value) -> str:
 
 
 def split_sentences(value) -> List[str]:
-    """
-    Split source text without treating periods inside common abbreviations
-    such as U.S. as sentence boundaries.
-
-    Important normalization rule from the classification methodology:
-    write/read "the United States" rather than "the U.S." so an operative
-    provision such as "Prohibition on U.S. government purchases ..." is
-    never truncated to "Prohibition on U.S."
-    """
     raw = "" if pd.isna(value) else str(value)
-
-    # Normalize U.S. variants BEFORE sentence splitting.
-    raw = re.sub(r"(?i)\\bthe\\s+U\\.\\s*S\\.\\b", "the United States", raw)
-    raw = re.sub(r"(?i)\\bU\\.\\s*S\\.\\b", "United States", raw)
-
-    # Protect a few other frequent abbreviations that can occur in bill text.
-    protected = {
-        "U.K.": "UK",
-        "U.N.": "UN",
-        "e.g.": "eg",
-        "i.e.": "ie",
-    }
-    for abbr, replacement in protected.items():
-        raw = re.sub(re.escape(abbr), replacement, raw, flags=re.IGNORECASE)
-
-    return [
-        s.strip()
-        for s in re.split(r"(?<=[.!?;])\\s+|\\n+", raw)
-        if s.strip()
-    ]
+    return [s.strip() for s in re.split(r"(?<=[.!?;])\s+|\n+", raw) if s.strip()]
 
 
 def is_consequence(sentence: str) -> bool:
@@ -148,13 +120,6 @@ def has_legal_effect(sentence: str) -> bool:
     return any(re.search(rf"\b\w*{re.escape(stem)}\w*\b", s) for stem in LEGAL_EFFECT)
 
 
-def normalize_provision_text(value: str) -> str:
-    """Keep provision wording sentence-safe and audit-friendly."""
-    value = re.sub(r"(?i)\\bthe\\s+U\\.\\s*S\\.\\b", "the United States", value)
-    value = re.sub(r"(?i)\\bU\\.\\s*S\\.\\b", "United States", value)
-    return re.sub(r"\\s+", " ", value).strip()
-
-
 def extract_provision(row: pd.Series) -> Tuple[str, str]:
     """Mechanism first, Summary second, Title only as fallback."""
     for source in ["Mechanism", "Analytical Summary"]:
@@ -162,12 +127,12 @@ def extract_provision(row: pd.Series) -> Tuple[str, str]:
             continue
         for sentence in split_sentences(row.get(source, "")):
             if not is_consequence(sentence) and has_legal_effect(sentence):
-                return normalize_provision_text(sentence), source
+                return sentence.strip(), source
 
     # No stated provision in the two substantive fields.
     title = "" if pd.isna(row.get("Title", "")) else str(row.get("Title", "")).strip()
     if title and has_legal_effect(title):
-        return normalize_provision_text(title), "Title"
+        return title, "Title"
     return "NONE STATED", "None"
 
 
