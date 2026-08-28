@@ -1,0 +1,9 @@
+*.xlsx
+*.xls
+*.docx
+~$*
+__pycache__/
+*.pyc
+.env
+.venv/
+myenv/
