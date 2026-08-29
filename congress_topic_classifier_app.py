@@ -69,7 +69,7 @@ LEGAL_EFFECT = [
     "prohibit", "bar", "require", "impose", "levy", "authoriz", "authoris",
     "appropriate", "fund", "establish", "direct", "restrict", "suspend",
     "withdraw", "designate", "amend", "condition", "screen", "certif",
-    "repeal", "waive", "allocate", "maintain"
+    "repeal", "waive", "allocate", "maintain", "condemn", "call", "express", "urge", "support"
 ]
 CONSEQUENCE_MARKERS = [
     "could", "may", "might", "potentially", "likely", "reflects", "signals",
@@ -95,6 +95,34 @@ THIRD_COUNTRIES = [
 ]
 
 
+def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize Excel headers without changing the underlying data.
+
+    Handles headers such as:
+      "Analytical Summary "
+      " analytical summary"
+      "ANALYTICAL SUMMARY"
+      non-breaking spaces copied from Excel/Word
+    """
+    canonical = {
+        "title": "Title",
+        "analytical summary": "Analytical Summary",
+        "mechanism": "Mechanism",
+        "congress": "Congress",
+        "bill": "Bill",
+    }
+
+    rename_map = {}
+    for col in df.columns:
+        normalized = str(col).replace("\u00a0", " ")
+        normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+        if normalized in canonical:
+            rename_map[col] = canonical[normalized]
+
+    return df.rename(columns=rename_map)
+
+
 def clean_text(value) -> str:
     if pd.isna(value):
         return ""
@@ -104,8 +132,36 @@ def clean_text(value) -> str:
 
 
 def split_sentences(value) -> List[str]:
+    """
+    Split source text without treating periods inside common abbreviations
+    such as U.S. as sentence boundaries.
+
+    Important normalization rule from the classification methodology:
+    write/read "the United States" rather than "the U.S." so an operative
+    provision such as "Prohibition on U.S. government purchases ..." is
+    never truncated to "Prohibition on U.S."
+    """
     raw = "" if pd.isna(value) else str(value)
-    return [s.strip() for s in re.split(r"(?<=[.!?;])\s+|\n+", raw) if s.strip()]
+
+    # Normalize U.S. variants BEFORE sentence splitting.
+    raw = re.sub(r"(?i)\\bthe\\s+U\\.\\s*S\\.\\b", "the United States", raw)
+    raw = re.sub(r"(?i)\\bU\\.\\s*S\\.\\b", "United States", raw)
+
+    # Protect a few other frequent abbreviations that can occur in bill text.
+    protected = {
+        "U.K.": "UK",
+        "U.N.": "UN",
+        "e.g.": "eg",
+        "i.e.": "ie",
+    }
+    for abbr, replacement in protected.items():
+        raw = re.sub(re.escape(abbr), replacement, raw, flags=re.IGNORECASE)
+
+    return [
+        s.strip()
+        for s in re.split(r"(?<=[.!?;])\\s+|\\n+", raw)
+        if s.strip()
+    ]
 
 
 def is_consequence(sentence: str) -> bool:
@@ -120,19 +176,32 @@ def has_legal_effect(sentence: str) -> bool:
     return any(re.search(rf"\b\w*{re.escape(stem)}\w*\b", s) for stem in LEGAL_EFFECT)
 
 
+def normalize_provision_text(value: str) -> str:
+    """Keep provision wording sentence-safe and audit-friendly."""
+    value = re.sub(r"(?i)\\bthe\\s+U\\.\\s*S\\.\\b", "the United States", value)
+    value = re.sub(r"(?i)\\bU\\.\\s*S\\.\\b", "United States", value)
+    return re.sub(r"\\s+", " ", value).strip()
+
+
 def extract_provision(row: pd.Series) -> Tuple[str, str]:
-    """Mechanism first, Summary second, Title only as fallback."""
-    for source in ["Mechanism", "Analytical Summary"]:
+    """
+    Analytical Summary first and in full; Mechanism second for confirmation/gap fill.
+    Title is used only as the permitted fallback.
+    """
+    for source in ["Analytical Summary", "Mechanism"]:
         if source not in row.index:
             continue
-        for sentence in split_sentences(row.get(source, "")):
-            if not is_consequence(sentence) and has_legal_effect(sentence):
-                return sentence.strip(), source
 
-    # No stated provision in the two substantive fields.
+        # Read every sentence, not only the first sentence.
+        for sentence in split_sentences(row.get(source, "")):
+            if has_legal_effect(sentence):
+                return normalize_provision_text(sentence), source
+
+    # Title fallback. Resolutions can still state an operative action.
     title = "" if pd.isna(row.get("Title", "")) else str(row.get("Title", "")).strip()
     if title and has_legal_effect(title):
-        return title, "Title"
+        return normalize_provision_text(title), "Title"
+
     return "NONE STATED", "None"
 
 
@@ -412,7 +481,7 @@ st.title("🧭 Congress Bill Topic Intelligence")
 st.markdown(
     '<div class="hero-note"><b>Upload → classify → inspect evidence → explore patterns → export.</b> '
     'Each bill is assigned to exactly one of the 22 approved topics using a '
-    '<b>Mechanism → Analytical Summary → Title fallback</b> provision-first method.</div>',
+    '<b>Analytical Summary → Mechanism → Title fallback</b> provision-first method.</div>',
     unsafe_allow_html=True,
 )
 
@@ -426,11 +495,11 @@ with st.sidebar:
     st.caption("Nothing is read from a local default path — you choose the file.")
     st.divider()
     st.markdown("**🧠 Classifier**")
-    st.write("Provision-first rules + TF-IDF/keywords applied only to the extracted provision.")
+    st.write("Clean-summary provision extraction + strict tie-break rules + TF-IDF/keywords applied only to the extracted provision.")
     st.write("No OpenAI API key is required.")
     st.divider()
     st.markdown("**Required columns**")
-    st.code("Mechanism\nAnalytical Summary\nTitle", language=None)
+    st.code("Analytical Summary\nMechanism\nTitle", language=None)
 
 if uploaded is None:
     st.info("👈 Upload your master Excel file from the sidebar to start.")
@@ -438,6 +507,7 @@ if uploaded is None:
 
 try:
     raw_df = pd.read_excel(uploaded)
+    raw_df = normalize_column_names(raw_df)
 except Exception as exc:
     st.error(f"Could not read the Excel file: {exc}")
     st.stop()
