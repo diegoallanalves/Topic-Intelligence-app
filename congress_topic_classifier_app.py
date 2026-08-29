@@ -183,27 +183,128 @@ def normalize_provision_text(value: str) -> str:
     return re.sub(r"\\s+", " ", value).strip()
 
 
+def provision_candidate_score(sentence: str) -> float:
+    """
+    Rank sentences by how likely they are to state what the bill actually does.
+    This deliberately goes beyond the narrow legal-verb test so NONE STATED
+    remains a true last resort.
+    """
+    s = clean_text(sentence)
+    if not s:
+        return -999.0
+
+    score = 0.0
+
+    # Strongest signal: explicit legal/operative verb.
+    if has_legal_effect(sentence):
+        score += 10.0
+
+    # Common operative constructions found in cleaned Congressional summaries.
+    operative_patterns = [
+        r"\bprohibition on\b", r"\bban on\b", r"\brestriction on\b",
+        r"\brequires?\b", r"\bprohibits?\b", r"\bbars?\b",
+        r"\bimposes?\b", r"\blevies?\b", r"\bauthori[sz]es?\b",
+        r"\bappropriates?\b", r"\bfunds?\b", r"\bestablishes?\b",
+        r"\bdirects?\b", r"\brestricts?\b", r"\bsuspends?\b",
+        r"\bwithdraws?\b", r"\bdesignates?\b", r"\bamends?\b",
+        r"\bconditions?\b", r"\bscreens?\b", r"\bcertifies?\b",
+        r"\brepeals?\b", r"\bwaives?\b", r"\ballocates?\b",
+        r"\bmaintains?\b", r"\bcondemns?\b", r"\bcalls on\b",
+        r"\bexpresses the sense\b", r"\burges?\b",
+        r"\bcreates?\b", r"\bexpands?\b", r"\bextends?\b",
+        r"\bstrengthens?\b", r"\bincreases?\b", r"\bprovides?\b",
+        r"\bmandates?\b", r"\bprevents?\b", r"\bblocks?\b",
+        r"\bremoves?\b", r"\bexcludes?\b", r"\bpermits?\b",
+        r"\btargets?\b", r"\baddresses?\b", r"\bseeks to\b",
+        r"\baims to\b",
+    ]
+    if any(re.search(p, s) for p in operative_patterns):
+        score += 7.0
+
+    # Instrument/object language helps identify substantive sentences.
+    instrument_terms = [
+        "tariff", "duty", "customs", "sanction", "export control",
+        "export license", "entity list", "procurement", "purchase",
+        "appropriation", "funding", "visa", "cfius", "acquisition",
+        "ownership", "border", "asylum", "bulk power", "grid",
+        "transformer", "solar", "nuclear", "critical mineral",
+        "fentanyl", "telecom", "semiconductor", "cyber", "foreign aid",
+        "state department", "supply chain", "domestic manufacturing",
+        "military", "defense", "trade remedy", "market economy",
+        "human rights", "religious", "genocide", "taiwan", "hong kong",
+        "xinjiang", "uyghur", "currency", "capital market",
+    ]
+    score += min(5.0, sum(1.0 for term in instrument_terms if term in s))
+
+    # Prefer informative clauses over very short fragments.
+    words = s.split()
+    if len(words) >= 8:
+        score += 2.0
+    if len(words) >= 14:
+        score += 1.0
+
+    # Cleaned summaries should no longer contain DAQO consequence text, but
+    # retain a defensive penalty rather than rejecting the whole sentence.
+    consequence_terms = [
+        "could", "might", "potentially", "likely", "risk to",
+        "poses a risk", "daqO".lower(), "market exposure",
+    ]
+    score -= 6.0 * sum(1 for term in consequence_terms if term in s)
+
+    return score
+
+
 def extract_provision(row: pd.Series) -> Tuple[str, str]:
     """
-    Analytical Summary first and in full; Mechanism second for confirmation/gap fill.
-    Title is used only as the permitted fallback.
+    Revised workflow:
+      1. Read the ENTIRE cleaned Analytical Summary and rank all sentences.
+      2. Use Mechanism to fill a gap when the Summary has no usable provision.
+      3. Use Title only as the permitted fallback.
+      4. NONE STATED is the true last resort.
+
+    The best sentence is selected across the full source instead of stopping
+    at the first sentence that happens to contain a particular verb.
     """
     for source in ["Analytical Summary", "Mechanism"]:
         if source not in row.index:
             continue
 
-        # Read every sentence, not only the first sentence.
-        for sentence in split_sentences(row.get(source, "")):
-            if has_legal_effect(sentence):
-                return normalize_provision_text(sentence), source
+        sentences = split_sentences(row.get(source, ""))
+        candidates = []
+        for position, sentence in enumerate(sentences):
+            score = provision_candidate_score(sentence)
+            candidates.append((score, -position, sentence))
 
-    # Title fallback. Resolutions can still state an operative action.
+        if candidates:
+            candidates.sort(reverse=True)
+            best_score, _, best_sentence = candidates[0]
+
+            # Explicit/strong operative sentence.
+            if best_score >= 7.0:
+                return normalize_provision_text(best_sentence), source
+
+            # For the already-cleaned Analytical Summary, a substantive,
+            # informative sentence is preferable to incorrectly returning
+            # NONE STATED merely because it lacks our exact verb vocabulary.
+            if source == "Analytical Summary":
+                substantive = [
+                    (score, pos, sentence)
+                    for score, pos, sentence in candidates
+                    if len(clean_text(sentence).split()) >= 8
+                ]
+                if substantive:
+                    substantive.sort(reverse=True)
+                    return normalize_provision_text(substantive[0][2]), source
+
+    # Title fallback: use a meaningful title before NONE STATED.
     title = "" if pd.isna(row.get("Title", "")) else str(row.get("Title", "")).strip()
-    if title and has_legal_effect(title):
-        return normalize_provision_text(title), "Title"
+    if title:
+        t = clean_text(title)
+        generic_titles = {"", "act", "resolution", "joint resolution"}
+        if t not in generic_titles:
+            return normalize_provision_text(title), "Title"
 
     return "NONE STATED", "None"
-
 
 def keyword_score(text: str, topic: str) -> Tuple[float, List[str]]:
     hits, score = [], 0.0
@@ -349,8 +450,14 @@ def classify_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                     runner = "Human Rights & Political Repression"
                     confidence = 50
         else:
-            # Rubric confidence: 85 when a numbered tie-break decides; otherwise 95.
-            confidence = 85 if rule else 95
+            # Rubric confidence:
+            # 70 = provision had to be built from Title
+            # 85 = numbered tie-break decided an otherwise stated provision
+            # 95 = Summary/Mechanism provision explicitly supports one topic
+            if source == "Title":
+                confidence = 70
+            else:
+                confidence = 85 if rule else 95
 
         if not runner or runner == winner:
             # Derive a genuine second-best from the provision only.
@@ -702,7 +809,7 @@ st.divider()
 
 # ---------------- REVIEW QUEUE ----------------
 st.header("🧪 Quick review queue")
-st.caption("Borderline rows appear first so a human reviewer can validate the hardest cases quickly.")
+st.caption("50 = NONE STATED; 70 = Title fallback/loose provision. These rows appear first for human review.")
 review_cols = [
     c for c in ["Topic", "Provision", "Provision Source", "Topic Confidence", "Topic Runner-Up", "Bill", "Title", "Mechanism", "Analytical Summary"]
     if c in result_df.columns
